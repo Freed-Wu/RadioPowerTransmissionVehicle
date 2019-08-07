@@ -42,9 +42,15 @@ void main ( void ) {
 
 	switch ( P6IN & BIT5 ) {
 		case 1: // 基本要求
+			P2DIR &= ~ BIT1; // P2.1 input // LED1
+			P2OUT |= BIT1; // Set P2.1 as pull-Up resistance
+			P2IES |= BIT1; // P2.1 Hi/Lo edge
 			break;
 
 		default: // 发挥部分
+			P1DIR &= ~ BIT1; // P1.1 input // LED2
+			P1OUT |= BIT1; // Set P1.1 as pull-Up resistance
+			P1IES |= BIT1; // P1.1 Hi/Lo edge
 	}
 
 	/***********
@@ -57,9 +63,47 @@ void main ( void ) {
 /**********************************************************************
  *                                 避障                                 *
  **********************************************************************/
-/* TODO:中断 <08-08-19, Freed-Wu> */
+// PORT6 interrupt service routine
+#pragma vector=PORT6_VECTOR
+__interrupt void Port_6 ( void ) {
+	if ( P6IFG & BIT1 ) { // 是P6.1中断？
+		/* TODO:  <08-08-19, Freed-Wu> */
+		P6IFG &= ~BIT1; // 清P2.6中断标志
+	}
 
+	if ( P6IFG & BIT2 ) { // 是P6.2中断？
+		/* TODO:  <08-08-19, Freed-Wu> */
+		P6IFG &= ~BIT2; // 清P2.7中断标志
+	}
+
+	if ( P6IFG & BIT3 ) { // 是P6.3中断？
+		/* TODO:  <08-08-19, Freed-Wu> */
+		P6IFG &= ~BIT3; // 清P2.7中断标志
+	}
+
+	if ( P6IFG & BIT4 ) { // 是P6.4中断？
+		/* TODO:  <08-08-19, Freed-Wu> */
+		P6IFG &= ~BIT4; // 清P2.7中断标志
+	}
+}
 /**********************************************************************
  *                               电流传感器                                *
  **********************************************************************/
+// PORT6 interrupt service routine
+#pragma vector=PORT6_VECTOR
 /* TODO:中断 <08-08-19, Freed-Wu> */
+__interrupt void Port_6 ( void ) {
+	if ( P6IFG & BIT1 ) { // 是P6.1中断？
+		/* TODO:  <08-08-19, Freed-Wu> */
+		P6IFG &= ~BIT1; // 清P2.6中断标志
+	}
+
+	switch ( P6IN & BIT5 ) {
+		case 1: // 基本要求
+			P1OUT |= BIT1; // 点亮P1.1口LED
+			break;
+
+		default: // 发挥部分
+			P2OUT |= BIT1; // 点亮P2.1口LED
+	}
+}
