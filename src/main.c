@@ -1,109 +1,271 @@
+#include <stdio.h>
+#include <string.h>
 #include <msp430f5529.h>
 
+/**********************************************************************
+*                                 避障                                 *
+**********************************************************************/
+#define S1 (P2IN&BIT0)
+#define S2 (P2IN&BIT6)
+#define S3 (P2IN&BIT7)
+#define S4 (P2IN&BIT5)   //不亮 5V 亮 0V
+
+/*#define DEBUG*/
+#ifdef DEBUG
+	char str[];
+#endif
 #define TIMER_PERIOD 511
-#define DUTY_CYCLE 384 /*! TODO: 待调
- *  \todo 待调
- */
-#define DUTY_CYCLE2 128 /*! TODO: 待调
- *  \todo 待调
+#define VOLTAGE (3.3 * ADC12MEM0 / 0xfff )
+#define CURRENCY (( VOLTAGE - 2.5 ) / 0.185)
+
+unsigned int turn = 0;
+#define TURN_MAX 150
+int mode = 1; // 模式1、2、3
+int isCharge = 1; // 默认充电
+#define POWER_THRESHOLD 0.05 // 模式1、2下通电断电 
+#define CHARGE_THRESHOLD 0.5 // 模式3下靠近充电站远离充电站 
+
+void go_straight ( float );
+void turn_left ( float );
+void turn_right ( float );
+void turn_left_heavy ( float );
+void turn_right_heavy ( float );
+void SearchRun ( float );
+
+/**
+ *  @brief main
  */
 void main ( void ) {
 	/*********
 	 *  看门狗  *
 	 *********/
-	WDTCTL = WDTPW + WDTHOLD; // Stop WDT
+	WDTCTL = WDT_ADLY_16; // WDT 250ms, ACLK, interval timer
+	SFRIE1 |= WDTIE; // Enable WDT interrupt
 	/*********
 	 *  PWM  *
 	 *********/
-	P1DIR |= BIT2 + BIT3; // P1.2 and P1.3 output
+	P1DIR |= BIT2 + BIT3; // P1.2 and P1.3 output as PWM
 	P1SEL |= BIT2 + BIT3; // P1.2 and P1.3 options select
 	TA0CCR0 = TIMER_PERIOD - 1; // PWM Period
 	TA0CCTL1 = OUTMOD_7; // CCR1 reset/set
-	TA0CCR1 = DUTY_CYCLE; // CCR1 PWM duty cycle 512*75%=384
 	TA0CCTL2 = OUTMOD_7; // CCR2 reset/set 512*75%=128
-	TA0CCR2 = DUTY_CYCLE2; // CCR2 PWM duty cycle
 	TA0CTL = TASSEL__ACLK + MC__UP + TACLR; // ACLK, up mode, clear TAR
-	/********
-	 *  避障  *
-	 ********/
-	P6DIR &= ~ ( BIT1 + BIT2 + BIT3 + BIT4 ); // P6.1, P6.2, P6.3, P6.4 input
-	P6OUT |= ( BIT1 + BIT2 + BIT3 + BIT4 ); // Set P6.1, P6.2, P6.3, P6.4 as pull-Up resistance
-	P6IES |= ( BIT1 + BIT2 + BIT3 + BIT4 ); // P6.1, P6.2, P6.3, P6.4 Hi/Lo edge
 	/***********
 	 *  电流传感器  *
 	 ***********/
-	/* TODO:数据是串口吗？  <08-08-19, Freed-Wu> */
+	REFCTL0 &= ~REFMSTR; // 复位REFMSTR控制位，以使用ADC12_A参考电压控制寄存器
+	ADC12CTL0 = ADC12SHT02 + ADC12ON; // 采样时间Tsample = 64个ADC12CLK, ADC12 on
+	// ADC12MEMO0作为转换地址（缺省），脉冲采样模式（使用采样定时器）, 参考时钟源ACLK，单通道单次转换（缺省）
+	ADC12CTL1 = ADC12CSTARTADD_0 + ADC12SHP + ADC12SSEL_1 + ADC12CONSEQ_0;
+	ADC12MCTL0 = ADC12INCH_0 + ADC12SREF_0; // 输入通道0，参考电压（VR+ = AVcc, VR- = AVss）皆为缺省值，可注释掉
+	ADC12IE |= BIT0; // Enable interrupt
+	ADC12CTL0 |= ADC12ENC;  //ADC12ENC为低电平时相关控制寄存器才能被修改
+	P6SEL |= BIT0; // P6.0 ADC option select
+	#ifdef DEBUG
 	/**********
-	 *  模块检测  *
+	 *  UART  *
 	 **********/
-	P6DIR &= ~BIT5; // P6.5 input
-	P6OUT |= BIT5; // Set P6.5 as pull-Up resistance
-	P6IES |= BIT5; // P6.5 Hi/Lo edge
+	P3SEL |= BIT3 + BIT4;                     // P3.3,4 = USCI_A0 TXD/RXD
+	UCA0CTL1 |= UCSWRST;                      // **Put state machine in reset**
+	UCA0CTL1 |= UCSSEL_2;                     // SMCLK
+	UCA0BR0 = 9;                              // 1MHz 115200 (see User's Guide)
+	UCA0BR1 = 0;                              // 1MHz 115200
+	UCA0MCTL |= UCBRS_1 + UCBRF_0;            // Modulation UCBRSx=1, UCBRFx=0
+	UCA0CTL1 &= ~UCSWRST;                     // **Initialize USCI state machine**
+	UCA0IE |= UCRXIE;                         // Enable USCI_A0 RX interrupt
+	/*********
+	 *  LED  *
+	 *********/
+	P4DIR |= BIT7;
+	P1DIR |= BIT0;
+	P8DIR |= BIT1;
+	P8OUT |= BIT1;
 
-	switch ( P6IN & BIT5 ) {
-		case 1: // 基本要求
-			P2DIR &= ~ BIT1; // P2.1 input // LED1
-			P2OUT |= BIT1; // Set P2.1 as pull-Up resistance
-			P2IES |= BIT1; // P2.1 Hi/Lo edge
+	if ( P8IN & BIT2 ) {
+		mode = 3;
+		P1OUT |= BIT0;
+		P4OUT |= BIT7;
+
+	} else if ( P6IN & BIT5 ) {
+		mode = 1;
+		P1OUT |= BIT0;
+		P4OUT &= ~BIT7;
+
+	} else {
+		mode = 2;
+		P4OUT |= BIT7;
+		P1OUT &= ~BIT0;
+	}
+
+	P8OUT &= ~BIT1;
+	__bis_SR_register ( LPM0_bits + GIE ); // 进LPM0开总中断
+	#else
+	P8DIR |= BIT1;
+	P8OUT |= BIT1;
+
+	if ( P8IN & BIT2 )
+		mode = 3;
+
+	else if ( P6IN & BIT5 )
+		mode = 1;
+
+	else
+		mode = 2;
+
+	P8OUT &= ~BIT1;
+	__bis_SR_register ( LPM3_bits + GIE ); // 进LPM3开总中断
+	#endif
+
+	while ( 1 );
+}
+/**********************************************************************
+*                               电流传感器                                *
+**********************************************************************/
+#pragma vector = ADC12_VECTOR
+/**
+  *  @brief 电流传感器
+  */
+__interrupt void ADC12_ISR ( void ) {
+	switch ( __even_in_range ( ADC12IV, 34 ) ) {
+		case 0:
+			break; // Vector 0: No interrupt
+
+		case 2:
+			break; // Vector 2: ADC overflow
+
+		case 4:
+			break; // Vector 4: ADC timing overflow
+
+		case 6: // Vector 6: ADC12IFG0
+			#ifdef DEBUG
+			sprintf ( str, "%4d, %8f, %8f\r\n", ADC12MEM0, VOLTAGE, CURRENCY );
+			int i;
+
+			for ( i = 0; i < strlen ( str ); ++i ) {
+				UCA0TXBUF = str[i];                  // TX -> RXed character
+			}
+
+			#endif
+
+			switch ( mode ) {
+				case 3:
+					if ( CURRENCY < CHARGE_THRESHOLD ) // 远离充电站
+						isCharge = 0;
+
+					else   // 靠近充电站
+						isCharge = 1;
+
+					break;
+
+				default:
+					if ( CURRENCY < POWER_THRESHOLD ) // 断电
+						isCharge = 0;
+			}
+
 			break;
 
-		default: // 发挥部分
-			P1DIR &= ~ BIT1; // P1.1 input // LED2
-			P1OUT |= BIT1; // Set P1.1 as pull-Up resistance
-			P1IES |= BIT1; // P1.1 Hi/Lo edge
-	}
+		case 8:
+			break; // Vector 8: ADC12IFG1
 
-	/***********
-	 *  低功耗模式  *
-	 ***********/
-	__bis_SR_register ( LPM3_bits + GIE ); // 进LPM3并开总中断
-	__no_operation(); // For debugger
-}
-
-/**********************************************************************
- *                                 避障                                 *
- **********************************************************************/
-// PORT6 interrupt service routine
-#pragma vector=PORT6_VECTOR
-__interrupt void Port_6 ( void ) {
-	if ( P6IFG & BIT1 ) { // 是P6.1中断？
-		/* TODO:  <08-08-19, Freed-Wu> */
-		P6IFG &= ~BIT1; // 清P2.6中断标志
-	}
-
-	if ( P6IFG & BIT2 ) { // 是P6.2中断？
-		/* TODO:  <08-08-19, Freed-Wu> */
-		P6IFG &= ~BIT2; // 清P2.7中断标志
-	}
-
-	if ( P6IFG & BIT3 ) { // 是P6.3中断？
-		/* TODO:  <08-08-19, Freed-Wu> */
-		P6IFG &= ~BIT3; // 清P2.7中断标志
-	}
-
-	if ( P6IFG & BIT4 ) { // 是P6.4中断？
-		/* TODO:  <08-08-19, Freed-Wu> */
-		P6IFG &= ~BIT4; // 清P2.7中断标志
+		default:
+			break;
 	}
 }
 /**********************************************************************
- *                               电流传感器                                *
- **********************************************************************/
-// PORT6 interrupt service routine
-#pragma vector=PORT6_VECTOR
-/* TODO:中断 <08-08-19, Freed-Wu> */
-__interrupt void Port_6 ( void ) {
-	if ( P6IFG & BIT1 ) { // 是P6.1中断？
-		/* TODO:  <08-08-19, Freed-Wu> */
-		P6IFG &= ~BIT1; // 清P2.6中断标志
-	}
+*                                看门狗                                 *
+**********************************************************************/
+// Watchdog Timer interrupt service routine
+#pragma vector = WDT_VECTOR
+/**
+  *  @brief 看门狗
+  */
+__interrupt void WDT_ISR ( void ) {
+	switch ( mode ) {
+		case 1:
+			if ( isCharge ) {
+				ADC12CTL0 |= ADC12SC; // Start sampling/conversion
 
-	switch ( P6IN & BIT5 ) {
-		case 1: // 基本要求
-			P1OUT |= BIT1; // 点亮P1.1口LED
+			} else {
+				if ( turn < TURN_MAX ) {
+					SearchRun ( 1 );
+					turn ++ ;
+
+				} else
+					SearchRun ( 0 );
+			}
+
 			break;
 
-		default: // 发挥部分
-			P2OUT |= BIT1; // 点亮P2.1口LED
+		case 2:
+			if ( isCharge ) {
+				ADC12CTL0 |= ADC12SC; // Start sampling/conversion
+
+			} else
+				SearchRun ( 1 );
+
+			break;
+
+		default:
+			if ( isCharge )
+				SearchRun ( 1 );
+
+			else
+				SearchRun ( 1.3 );
+
+			ADC12CTL0 |= ADC12SC; // Start sampling/conversion
+	}
+}
+/**********************************************************************
+*                                 避障                                 *
+**********************************************************************/
+void go_straight ( float factor ) {
+	TA0CCR1 = ( unsigned int ) ( 100 * factor );
+	TA0CCR2 = ( unsigned int ) ( 100 * factor );
+}
+void turn_left ( float factor ) {
+	TA0CCR1 = ( unsigned int ) ( 100 * factor );
+	TA0CCR2 = ( unsigned int ) ( 200 * factor );
+}
+void turn_right ( float factor ) {
+	TA0CCR1 = ( unsigned int ) ( 200 * factor );
+	TA0CCR2 = ( unsigned int ) ( 100 * factor );
+}
+void turn_left_heavy ( float factor ) {
+	TA0CCR1 = ( unsigned int ) ( 20 * factor );
+	TA0CCR2 = ( unsigned int ) ( 120 * factor );
+}
+void turn_right_heavy ( float factor ) {
+	TA0CCR1 = ( unsigned int ) ( 120 * factor );
+	TA0CCR2 = ( unsigned int ) ( 20 * factor );
+}
+void SearchRun ( float factor ) {
+	/********左边碰到向左转*******/
+	if ( S2 ) { //
+		turn_left ( factor );
+		return;
+	}
+
+	/********右边碰到向右转*******/
+	if ( S3 ) { //
+		turn_right ( factor );
+		return;
+	}
+
+	/********最右边碰到重度右转*******/
+	if ( S4 ) { //
+		turn_right_heavy ( factor );
+		return;
+	}
+
+	/********最左边碰到重度左转*******/
+	if ( S1 ) {
+		turn_left_heavy ( factor );
+		return;
+	}
+
+	/********没碰到直走*******/
+	if ( S2 == 0 && S3 == 0 ) {
+		go_straight ( factor );
+		return;
 	}
 }
